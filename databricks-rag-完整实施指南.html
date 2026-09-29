@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Databricks 新一代 RAG 完整实施指南</title>
+<style>
+@page { size: A4; margin: 18mm 16mm 18mm 16mm; }
+body { font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", sans-serif; color:#1f2937; line-height:1.65; font-size:10.5pt; }
+h1 { color:#123b5d; font-size:26pt; margin-top:0; }
+h2 { color:#176b87; border-bottom:1px solid #b9d5df; padding-bottom:3px; margin-top:24px; }
+h3 { color:#315f73; margin-top:18px; }
+.cover { page-break-after:always; padding-top:35mm; }
+.subtitle { font-size:15pt; color:#4b6470; }
+.meta { margin-top:35mm; color:#64748b; }
+.callout { background:#eef7fa; border-left:4px solid #2087a5; padding:9px 13px; margin:12px 0; }
+.warn { background:#fff8e6; border-left-color:#d99100; }
+table { border-collapse:collapse; width:100%; margin:9px 0 15px; font-size:9.3pt; }
+th,td { border:1px solid #cbd5e1; padding:6px 7px; vertical-align:top; }
+th { background:#e8f2f5; color:#164e63; }
+pre { background:#f3f4f6; border:1px solid #e5e7eb; padding:9px; white-space:pre-wrap; font-size:8.2pt; line-height:1.4; }
+code { font-family:Consolas, monospace; }
+li { margin:2px 0; }
+.pagebreak { page-break-before:always; }
+.small { font-size:8.5pt; color:#64748b; }
+.source { font-size:8.5pt; overflow-wrap:anywhere; }
+</style>
+</head>
+<body>
+<section class="cover">
+<h1>Databricks 新一代 RAG</h1>
+<p class="subtitle">从企业文档接入到生产级 AI 应用的完整实施指南</p>
+<div class="callout"><b>适用对象：</b>数据工程师、AI/ML 工程师、应用开发团队、平台与治理团队。本文将“文档型 RAG”拆成可部署的 Databricks 数据与 AI 链路，并给出实现模板。</div>
+<p class="meta">版本：1.0<br>编写日期：2026 年 9 月 28 日<br>参考：用户提供的 LinkedIn 帖子、Databricks 官方文档</p>
+</section>
+
+<h2>1. 执行摘要</h2>
+<p>这篇方案讨论一种端到端的企业 RAG（Retrieval-Augmented Generation，检索增强生成）架构：先用 Lakeflow Connect 或文件接口把 SharePoint、Google Drive、S3、工作区文件等内容同步到 Unity Catalog；再用 <code>ai_parse_document</code> 将 PDF、图片、表格和扫描内容解析成结构化结果；随后使用 <code>ai_prep_search</code> 生成适合检索的语义分块和元数据；最后建立 Databricks AI Search / Vector Search 索引，并由 Databricks App 或模型服务端点完成检索、提示词拼接和回答。</p>
+<p>关键思想不是“把所有文件直接塞给大模型”，而是把文档处理、权限、检索、生成、评估和监控做成可复用的数据产品。</p>
+
+<div class="callout"><b>推荐落地顺序：</b>先做一个受控文档集合的最小闭环，再逐步加入增量同步、访问控制、混合检索、评估集、反馈监控和多租户隔离。</div>
+
+<h2>2. 这条方案解决什么问题</h2>
+<table><tr><th>企业痛点</th><th>传统做法的问题</th><th>Databricks RAG 做法</th></tr>
+<tr><td>文档来源分散</td><td>手工下载、脚本各自维护、更新不及时</td><td>用 Lakeflow Connect 或受控文件入口进入 Unity Catalog</td></tr>
+<tr><td>PDF/扫描件内容不可直接检索</td><td>只抽取纯文本，丢失表格、布局和图片上下文</td><td>文档解析保留页面、元素、版面和抽取结果</td></tr>
+<tr><td>关键词检索召回不准</td><td>同义词、自然语言问题、上下文表达难覆盖</td><td>语义分块 + 向量检索，并可叠加关键词/混合检索和重排</td></tr>
+<tr><td>回答无法审计</td><td>没有来源、版本、权限和提示词记录</td><td>返回 chunk_id、source_uri、文档版本和检索分数，建立评估与追踪</td></tr>
+<tr><td>数据权限泄露</td><td>应用层过滤容易遗漏</td><td>Unity Catalog 治理、行/列权限和索引过滤协同设计</td></tr></table>
+
+<h2>3. 总体架构</h2>
+<pre>
+[SharePoint / Google Drive / S3 / Upload]
+                  |
+       Lakeflow Connect / FILE / Volume
+                  |
+       Unity Catalog 原始文件层(raw_files)
+                  |
+       ai_parse_document ——> 解析 JSON / 页面 / 表格 / OCR
+                  |
+       ai_prep_search ——> 语义 chunk + metadata
+                  |
+       Delta chunk 表 + ACL 表
+                  |
+       Databricks AI Search / Vector Search index
+                  |
+       Databricks App / Model Serving / API
+                  |
+       权限过滤 -> 检索 -> 重排 -> LLM 生成 -> 引用与反馈
+</pre>
+<h3>3.1 分层设计</h3>
+<table><tr><th>层</th><th>职责</th><th>典型对象</th></tr>
+<tr><td>Source</td><td>保存原始文件和同步元数据，尽量不可变</td><td>Volume、FILE 表、原始 Delta 表</td></tr>
+<tr><td>Parse</td><td>抽取文本、页面、表格、图像描述和文档元素</td><td><code>ai_parse_document</code> 结果</td></tr>
+<tr><td>Prepare</td><td>规范化、去重、分块、加元数据、准备向量</td><td><code>ai_prep_search</code>、chunk Delta 表</td></tr>
+<tr><td>Retrieve</td><td>向量/关键词/混合检索、过滤、重排</td><td>AI Search / Vector Search index</td></tr>
+<tr><td>Serve</td><td>身份验证、提示词、回答、引用和反馈</td><td>Databricks App、Serving endpoint</td></tr>
+<tr><td>Evaluate</td><td>离线质量、在线延迟、安全与成本监控</td><td>评估集、MLflow tracing、系统表</td></tr></table>
+
+<h2>4. 前置准备</h2>
+<ol><li>创建或选择 Unity Catalog catalog/schema，并确定数据所有者和生产服务主体。</li><li>确认 Databricks Runtime、SQL Warehouse 和 AI Functions 可用性；不同 AI Function 的运行时要求可能不同，部署前以当前官方文档为准。</li><li>建立源系统到用户/组的身份映射；不要等到检索层才临时补权限。</li><li>准备至少 20–50 个真实问题的黄金评估集，每个问题包含期望答案、来源文档和可接受的引用范围。</li><li>决定数据新鲜度：小时级、日级还是事件触发；决定删除、重命名和权限变更如何传播。</li></ol>
+
+<h2>5. 第一步：接入原始文档</h2>
+<h3>5.1 选择接入方式</h3>
+<table><tr><th>方式</th><th>适合场景</th><th>注意事项</th></tr>
+<tr><td>Lakeflow Connect</td><td>已有 SaaS/文件源，需要持续增量同步</td><td>确认连接器、权限、删除语义和刷新频率</td></tr>
+<tr><td>Unity Catalog Volume</td><td>受控上传、批处理、PoC</td><td>需建立上传审计、命名和病毒扫描流程</td></tr>
+<tr><td>FILE 类型列</td><td>以表的形式统一保存文件与文件元数据</td><td>检查当前区域/运行时支持和预览限制</td></tr>
+<tr><td>对象存储 + Auto Loader</td><td>大规模文件流入、事件驱动</td><td>自己维护 schema、幂等、删除和坏文件处理</td></tr></table>
+<h3>5.2 原始表建议</h3>
+<pre><code>CREATE TABLE IF NOT EXISTS rag.raw_documents (
+  document_id STRING,
+  source_uri STRING,
+  source_system STRING,
+  source_path STRING,
+  file_name STRING,
+  mime_type STRING,
+  file_size BIGINT,
+  source_modified_at TIMESTAMP,
+  content_hash STRING,
+  acl_group_ids ARRAY&lt;STRING&gt;,
+  ingest_status STRING,
+  ingested_at TIMESTAMP,
+  file FILE
+) USING DELTA;</code></pre>
+<p>生产环境应以 <code>content_hash</code> 和源系统的稳定 ID 做幂等键；将删除和权限变化作为事件或状态，而不是仅依赖文件更新时间。</p>
+
+<h2>6. 第二步：解析文档</h2>
+<p><code>ai_parse_document</code> 的目标是把非结构化文件变成可处理的结构化结果。它尤其适合 PDF、扫描件、图片、表格和包含复杂版面的材料。解析输出应保留原始文档 ID、页码、元素类型、文本、坐标或布局信息（若返回），以便回答时生成可追溯引用。</p>
+<pre><code>CREATE OR REPLACE TABLE rag.parsed_documents AS
+SELECT
+  document_id,
+  source_uri,
+  source_modified_at,
+  ai_parse_document(file) AS parsed_doc
+FROM rag.raw_documents
+WHERE ingest_status = 'READY';</code></pre>
+<h3>6.1 解析后的规范化结构</h3>
+<pre><code>document_id | page_no | element_no | element_type
+             | text | table_json | image_ref | parser_version
+             | source_uri | source_modified_at | acl_group_ids</code></pre>
+<ul><li>正文：按标题、段落和列表保存。</li><li>表格：保留行列关系，不要只转成无分隔纯文本。</li><li>图片：若业务重要，额外生成图像描述或 OCR 文本，并明确这是推断结果。</li><li>页码：必须进入 chunk 元数据，便于 UI 展示“第 N 页”。</li><li>版本：保存解析器版本和源文件 hash，避免内容变化后无法解释结果差异。</li></ul>
+
+<h2>7. 第三步：准备语义检索数据</h2>
+<p><code>ai_prep_search</code> 用于把解析内容转换为更适合搜索的语义表示，通常包括清洗、分块、上下文补充和搜索元数据。分块不是越小越好：过小会丢失定义和条件，过大则会降低召回的精确度并增加生成成本。</p>
+<h3>7.1 分块策略</h3>
+<table><tr><th>文档类型</th><th>起始策略</th><th>验证重点</th></tr>
+<tr><td>政策/制度</td><td>按章节、条款、例外条件切分</td><td>回答必须同时召回适用范围和例外条款</td></tr>
+<tr><td>产品手册</td><td>按主题、步骤、参数表切分</td><td>步骤不能被拆散；参数和单位要保留</td></tr>
+<tr><td>合同/法律</td><td>按条款和定义切分，加入文档版本</td><td>必须显示来源和生效日期，不做无依据法律结论</td></tr>
+<tr><td>故障手册</td><td>按症状→原因→处置流程切分</td><td>召回顺序和操作前置条件</td></tr>
+<tr><td>表格报表</td><td>表格整体或按业务分组转写</td><td>列名、时间范围和单位不能丢失</td></tr></table>
+<h3>7.2 示例 SQL</h3>
+<pre><code>CREATE OR REPLACE TABLE rag.search_chunks AS
+SELECT
+  document_id,
+  chunk_id,
+  chunk_text,
+  named_struct(
+    'source_uri', source_uri,
+    'file_name', file_name,
+    'page_no', page_no,
+    'source_modified_at', source_modified_at,
+    'acl_group_ids', acl_group_ids,
+    'document_version', document_version
+  ) AS metadata
+FROM ai_prep_search(
+  TABLE rag.normalized_elements,
+  map('chunking_strategy', 'semantic',
+      'include_context', 'true')
+);</code></pre>
+<p class="small">说明：函数签名、参数名和可用选项会随 Databricks 版本和区域更新；上线前请按工作区文档验证。上述代码是流程模板，不应直接视为固定 API 合约。</p>
+
+<h2>8. 第四步：建立 AI Search / Vector Search</h2>
+<p>索引应以 chunk 表为输入，并同步正文、向量和可过滤元数据。推荐至少支持：按文档 ID、源系统、时间、部门、权限组、语言和文档状态过滤。对企业问答而言，纯向量检索通常不足以处理产品编号、合同号、错误码等精确字符串，因此应评估关键词与语义检索的混合策略。</p>
+<h3>8.1 索引字段建议</h3>
+<table><tr><th>字段</th><th>用途</th><th>是否可过滤</th></tr>
+<tr><td>chunk_text</td><td>语义检索和生成上下文</td><td>否</td></tr>
+<tr><td>embedding</td><td>向量相似度</td><td>否</td></tr>
+<tr><td>document_id/chunk_id</td><td>去重、引用、回溯</td><td>是</td></tr>
+<tr><td>source_uri/file_name/page_no</td><td>用户可点击引用</td><td>是</td></tr>
+<tr><td>acl_group_ids</td><td>权限过滤</td><td>是</td></tr>
+<tr><td>source_modified_at/document_version</td><td>时间与版本控制</td><td>是</td></tr></table>
+<h3>8.2 检索流程</h3>
+<ol><li>从用户身份得到组/角色集合。</li><li>将问题规范化，但不要删除专有名词、编号和日期。</li><li>执行向量或混合检索，并带上 ACL、租户、状态过滤。</li><li>取较大的候选集，再用重排或业务规则选出最终上下文。</li><li>去除重复 chunk，按文档版本和来源排序。</li><li>把引用元数据与文本一起传给生成模型。</li></ol>
+
+<h2>9. 第五步：构建问答应用</h2>
+<h3>9.1 最小提示词模板</h3>
+<pre><code>系统：你是企业知识助手。只依据“检索上下文”回答。
+如果上下文不足，明确说“资料不足”，不要猜测。
+回答结论后列出引用：[文件名，第 X 页，版本 Y]。
+涉及权限、金额、合规或安全时，提醒用户以正式流程为准。
+
+用户问题：{question}
+
+检索上下文：
+{retrieved_chunks}
+</code></pre>
+<h3>9.2 UI 必备能力</h3>
+<ul><li>显示答案依据：文件名、页码、版本、更新时间和可点击源链接。</li><li>显示“不确定/资料不足”状态，而不是用肯定语气填空。</li><li>支持过滤器：部门、文档类型、时间范围和业务域。</li><li>保留用户反馈、检索结果和最终答案，用于评估；敏感内容须脱敏。</li><li>在流式输出时先显示检索状态，再显示答案，避免用户误以为模型已完成验证。</li></ul>
+
+<h2>10. 典型业务场景</h2>
+<table><tr><th>场景</th><th>输入</th><th>检索/生成要求</th><th>主要风险</th></tr>
+<tr><td>员工政策助手</td><td>制度、HR FAQ</td><td>按地区/员工类型过滤，显示生效日期</td><td>过期政策、个性化权限</td></tr>
+<tr><td>客服知识助手</td><td>产品手册、故障库</td><td>错误码精确匹配 + 语义召回</td><td>错误操作、版本错配</td></tr>
+<tr><td>销售赋能</td><td>产品资料、竞品分析</td><td>按产品版本和市场过滤</td><td>机密外泄、虚构卖点</td></tr>
+<tr><td>合同检索</td><td>合同、条款模板</td><td>条款级引用、版本与签署状态</td><td>法律结论、权限泄露</td></tr>
+<tr><td>运维助手</td><td>Runbook、告警文档</td><td>按环境和服务过滤，输出步骤和前置条件</td><td>高风险自动执行</td></tr>
+<tr><td>研究/报告问答</td><td>报告、论文、表格</td><td>表格结构、时间范围和来源完整性</td><td>统计误读、引用不完整</td></tr></table>
+
+<h2>11. 安全、治理与合规</h2>
+<ol><li><b>最小权限：</b>源连接、解析任务、索引服务和应用服务主体分别授予必要权限。</li><li><b>检索前授权：</b>ACL 过滤必须在检索阶段生效；仅在提示词中要求模型“不回答机密内容”是不够的。</li><li><b>租户隔离：</b>多租户场景优先使用可验证的租户字段和服务端过滤；不要依赖客户端传入的租户 ID。</li><li><b>数据生命周期：</b>定义删除、保留、撤回、权限变更和索引同步 SLA。</li><li><b>秘密管理：</b>API key、连接凭据和 OAuth secret 放入受控 secret 管理，不进 notebook、日志或 prompt。</li><li><b>审计：</b>记录谁在何时对哪个数据范围提出问题、检索了哪些 chunk、生成了什么答案；按公司政策控制保留期限。</li><li><b>提示词注入：</b>把文档内容视为不可信输入；模型必须遵循系统规则，不执行文档中的工具调用或越权指令。</li></ol>
+
+<h2>12. 评估与生产验收</h2>
+<h3>12.1 离线指标</h3>
+<table><tr><th>指标</th><th>含义</th><th>建议验收问题</th></tr>
+<tr><td>Recall@k</td><td>正确来源是否进入候选集</td><td>前 5 个结果是否包含黄金来源</td></tr>
+<tr><td>Context precision</td><td>上下文是否少噪声</td><td>检索内容是否与问题直接相关</td></tr>
+<tr><td>Faithfulness</td><td>答案是否被上下文支持</td><td>每个关键结论是否有依据</td></tr>
+<tr><td>Answer correctness</td><td>最终回答是否正确、完整</td><td>专家评分或标准答案比对</td></tr>
+<tr><td>引用正确率</td><td>引用是否真的支持结论</td><td>链接、页码、版本能否复核</td></tr></table>
+<h3>12.2 必测用例</h3>
+<ul><li>同一主题存在多个版本时，是否优先生效版本。</li><li>用户无权访问文档时，是否既不返回内容也不泄露文件名。</li><li>问题包含错别字、别名、错误码、编号和日期时的召回情况。</li><li>跨页表格、扫描 PDF、图片、双语文档和空白页。</li><li>文档删除或权限撤回后，索引和回答多久停止使用旧内容。</li><li>模型服务不可用、索引延迟、解析失败时，是否有可理解的降级提示。</li></ul>
+
+<h2>13. 性能与成本优化</h2>
+<ul><li>只对新增或内容 hash 变化的文件重新解析和分块。</li><li>为高频问题缓存安全的检索结果，但要把权限和文档版本纳入缓存键。</li><li>候选集、chunk 长度和重排数量通过评估集调优，不要盲目增加上下文。</li><li>大表格和长文档采用分层摘要：先检索摘要，再按需读取原文片段。</li><li>区分批处理、准实时和在线请求预算，避免在同步链路里同步执行昂贵生成。</li><li>用查询日志、模型 token、索引刷新和任务运行时建立成本看板。</li></ul>
+
+<h2>14. 交付路线图</h2>
+<table><tr><th>阶段</th><th>交付物</th><th>退出标准</th></tr>
+<tr><td>0. 设计</td><td>数据地图、权限模型、评估集、架构图</td><td>明确数据所有者、SLA 和风险边界</td></tr>
+<tr><td>1. PoC</td><td>单一来源、解析、chunk、索引、问答 Demo</td><td>黄金问题中大部分可追溯回答</td></tr>
+<tr><td>2. 试点</td><td>增量同步、ACL、反馈、监控、故障处理</td><td>业务用户可用，权限测试通过</td></tr>
+<tr><td>3. 生产</td><td>Bundle/CI-CD、服务主体、评估门禁、审计</td><td>可重复部署，达到延迟、质量和成本 SLO</td></tr>
+<tr><td>4. 扩展</td><td>多源、多语言、多租户、Agent/工具调用</td><td>每个扩展场景独立完成安全和评估</td></tr></table>
+
+<h2>15. 上线检查清单</h2>
+<ul><li>□ 所有数据集有 owner、分类、保留策略和访问矩阵</li><li>□ 原始文件、解析结果、chunk 和索引都能按版本追溯</li><li>□ 增量、删除、重命名和权限撤回已测试</li><li>□ 检索过滤在服务端执行，并有越权自动化测试</li><li>□ 回答强制提供引用或明确标记资料不足</li><li>□ 已建立 Recall、faithfulness、正确率、延迟和成本指标</li><li>□ 失败任务、索引落后、模型超时和配额错误有告警</li><li>□ 部署由 DAB/CI-CD 管理，不依赖个人 notebook 状态</li><li>□ 生产日志脱敏，prompt、chunk 和用户反馈按政策保留</li></ul>
+
+<h2>16. 参考资料与说明</h2>
+<p>本文基于用户提供的 LinkedIn 帖子主题进行归纳，并结合 Databricks 官方文档组织为实施指南。文中的 SQL 主要用于解释架构和数据流；具体函数签名、运行时要求、区域可用性、Preview/Beta 状态以及产品命名可能变化，实施时应在目标工作区版本上重新验证。</p>
+<p class="source">Databricks 文档索引：https://docs.databricks.com/llms.txt</p>
+<p class="source">AI Functions 概览：https://docs.databricks.com/aws/en/large-language-models/ai-functions</p>
+<p class="source">ai_parse_document：https://docs.databricks.com/aws/en/sql/language-manual/functions/ai_parse_document</p>
+<p class="source">ai_prep_search：https://docs.databricks.com/aws/en/sql/language-manual/functions/ai_prep_search</p>
+<p class="source">AI Search / Vector Search：https://docs.databricks.com/aws/en/generative-ai/ai-search/</p>
+<p class="source">Lakeflow Connect：https://docs.databricks.com/aws/en/ingestion/lakeflow-connect</p>
+<p class="source">Databricks Apps：https://docs.databricks.com/aws/en/dev-tools/databricks-apps/</p>
+<p class="source">Unity Catalog：https://docs.databricks.com/aws/en/data-governance/unity-catalog/</p>
+<p class="source">用户提供的 LinkedIn 帖子：https://www.linkedin.com/posts/thomas-hass-53b39b19a_</p>
+</body></html>

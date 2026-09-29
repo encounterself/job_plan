@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Databricks 新 RAG Stack：官方核验与实施指南</title>
+<style>
+@font-face{font-family:NotoSansSC;src:url('file:///home/sandbox-agent/workspace/assets/NotoSansSC-Regular.otf')} 
+@page{size:A4;margin:17mm 16mm}body{font-family:NotoSansSC,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;color:#1f2937;line-height:1.65;font-size:10.5pt}h1{color:#123b5d;font-size:25pt;margin:0 0 12px}h2{color:#176b87;border-bottom:1px solid #b9d5df;padding-bottom:3px;margin-top:23px}h3{color:#315f73;margin-top:16px}.cover{page-break-after:always;padding-top:32mm}.subtitle{font-size:15pt;color:#4b6470}.meta{margin-top:28mm;color:#64748b}.box{background:#eef7fa;border-left:4px solid #2087a5;padding:9px 13px;margin:12px 0}.warn{background:#fff8e6;border-left-color:#d99100}table{border-collapse:collapse;width:100%;margin:9px 0 14px;font-size:9.1pt}th,td{border:1px solid #cbd5e1;padding:6px;vertical-align:top}th{background:#e8f2f5;color:#164e63}pre{background:#f3f4f6;border:1px solid #e5e7eb;padding:9px;white-space:pre-wrap;font-size:8.1pt;line-height:1.4}code{font-family:Consolas,monospace}.small{font-size:8.3pt;color:#64748b}.source{font-size:8.3pt;overflow-wrap:anywhere}li{margin:2px 0}
+ .diagram{display:block;width:100%;height:auto;margin:12px 0 18px;background:#fbfdfe;border:1px solid #dbe7eb;border-radius:8px}.diagram-heading{page-break-before:always}.svg-title{font-family:NotoSansSC,"Microsoft YaHei",sans-serif;font-size:18px;font-weight:700;fill:#164e63}.svg-label{font-family:NotoSansSC,"Microsoft YaHei",sans-serif;font-size:14px;fill:#365866}.svg-note{font-family:NotoSansSC,"Microsoft YaHei",sans-serif;font-size:13px;fill:#64748b}
+</style></head><body>
+<section class="cover"><h1>Databricks 新 RAG Stack</h1><p class="subtitle">基于 LinkedIn 帖子与 Databricks 官方文档的核验版实施指南</p><div class="box"><b>结论：</b>RAG 没有消失；企业 RAG 正从“切文本 + 向量库”升级为由受治理的数据摄取、文档解析、语义分块、混合检索、重排和应用编排组成的完整系统。</div><p class="meta">版本：2.0（官方核验版）<br>日期：2026 年 9 月 28 日<br>适用：Databricks AI Functions、AI Search、Lakeflow Connect、Databricks Apps</p></section>
+
+<h2>1. 帖子内容的准确总结</h2>
+<p>Thomas Hass 的帖子反驳“RAG architecture are dead”的观点，核心论点是：即使模型上下文窗口越来越大，也不能把所有企业数据不加选择地塞入上下文；检索、权限、更新、成本和可解释性仍然需要架构。</p>
+<p>帖子给出的新链路是：</p><ol><li><b>Ingestion：</b>使用 Lakeflow Connect 从 SharePoint、Google Drive 等来源增量摄取；用 FILE 类型把文件存入 Volume，并在表中保留受治理的指针。</li><li><b>Parsing：</b>使用 <code>ai_parse_document</code>，以语义合理且带元数据的方式解析文档。</li><li><b>Chunking：</b>使用新的 <code>ai_prep_search</code> 生成语义合理的 chunk，并增加样例问题等元数据来改善检索。</li><li><b>Indexing：</b>计算 embedding 并写入 AI Search。</li><li><b>Retrieval：</b>结合 hybrid search、原生 reranking 和 filters 优化召回。</li><li><b>Serving：</b>把编排部署为 Databricks App，以获得灵活的 agent orchestration、快速迭代、版本管理和 CI/CD。</li></ol>
+<div class="box"><b>帖子与官方文档的对应关系：</b>帖子给出产品组合和实践视角；官方文档确认 AI Functions、AI Search 和 Apps 的接口、限制、权限及运行条件。二者结合后，才形成可落地的生产方案。</div>
+
+<h2>2. 官方能力核验</h2>
+<table><tr><th>帖子步骤</th><th>Databricks 能力</th><th>官方核验结果</th></tr><tr><td>摄取</td><td>Lakeflow Connect、Unity Catalog Volume、FILE</td><td>用于把源数据纳入 Lakehouse；增量和权限传播要按具体连接器设计。</td></tr><tr><td>解析</td><td><code>ai_parse_document</code></td><td>解析文本、表格、图形描述和版面；支持 PDF、Office、图片等文档类型。</td></tr><tr><td>分块</td><td><code>ai_prep_search</code></td><td>Beta；将解析结果或纯文本/Markdown 变成适合 AI Search/RAG 的语义 chunk，并可抽取结构化元数据。</td></tr><tr><td>索引</td><td>Databricks AI Search</td><td>原 Databricks Vector Search；可从 Delta 等表建索引并同步源表更新。</td></tr><tr><td>检索</td><td>Hybrid、filter、reranking、ACL</td><td>官方支持；混合检索用向量相似度与关键词检索结合，RRF 融合排序。</td></tr><tr><td>服务</td><td>Databricks Apps</td><td>可添加 AI Search index resource；应用服务主体需要受治理的 catalog/schema/index 权限。</td></tr></table>
+
+<h2 class="diagram-heading">3. 推荐生产架构</h2>
+<svg class="diagram diagram-tall" viewBox="0 0 900 680" role="img" aria-label="Databricks RAG production architecture">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#34758a"/></marker></defs>
+<rect x="70" y="24" width="760" height="72" rx="12" fill="#e8f2f5" stroke="#34758a" stroke-width="2"/><text x="450" y="54" text-anchor="middle" class="svg-title">1  企业数据源</text><text x="450" y="80" text-anchor="middle" class="svg-label">SharePoint · Google Drive · Object Storage · Upload</text>
+<rect x="70" y="132" width="760" height="72" rx="12" fill="#e8f2f5" stroke="#34758a" stroke-width="2"/><text x="450" y="162" text-anchor="middle" class="svg-title">2  摄取与治理</text><text x="450" y="188" text-anchor="middle" class="svg-label">Lakeflow Connect · Unity Catalog Volume · FILE · 增量同步</text>
+<rect x="70" y="240" width="760" height="72" rx="12" fill="#e8f2f5" stroke="#34758a" stroke-width="2"/><text x="450" y="270" text-anchor="middle" class="svg-title">3  文档解析</text><text x="450" y="296" text-anchor="middle" class="svg-label">ai_parse_document · PDF · Office · 图片 · 表格 · 页面元数据</text>
+<rect x="70" y="348" width="760" height="72" rx="12" fill="#e8f2f5" stroke="#34758a" stroke-width="2"/><text x="450" y="378" text-anchor="middle" class="svg-title">4  语义准备</text><text x="450" y="404" text-anchor="middle" class="svg-label">ai_prep_search · chunk_to_retrieve · chunk_to_embed · metadata</text>
+<rect x="70" y="456" width="760" height="72" rx="12" fill="#d9f2e3" stroke="#2c8452" stroke-width="2"/><text x="450" y="486" text-anchor="middle" class="svg-title">5  Databricks AI Search</text><text x="450" y="512" text-anchor="middle" class="svg-label">Hybrid Search · Filters · Reranking · ACL · Index Sync</text>
+<rect x="70" y="564" width="760" height="72" rx="12" fill="#f0eaff" stroke="#7655a8" stroke-width="2"/><text x="450" y="594" text-anchor="middle" class="svg-title">6  应用与模型服务</text><text x="450" y="620" text-anchor="middle" class="svg-label">Databricks App / API · Grounded Answer · Sources · Feedback</text>
+<path d="M450 96v36M450 204v36M450 312v36M450 420v36M450 528v36" stroke="#34758a" stroke-width="3" marker-end="url(#arrow)"/>
+<text x="450" y="664" text-anchor="middle" class="svg-note">数据平面负责可追溯与可治理；应用平面负责检索编排与带引用回答</text>
+</svg>
+<p>建议将原始文件、解析结果、搜索准备结果和索引源表分层保存。每层保留 <code>document_id</code>、<code>source_uri</code>、源修改时间、内容 hash、版本和 ACL 元数据，避免只能看到“当前答案”而无法复核答案来源。</p>
+
+<h2 class="diagram-heading">4. 数据流与检索决策</h2>
+<svg class="diagram diagram-tall" viewBox="0 0 900 540" role="img" aria-label="RAG retrieval decision flow">
+<defs><marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#34758a"/></marker></defs>
+<rect x="250" y="24" width="400" height="70" rx="12" fill="#e8f2f5" stroke="#34758a" stroke-width="2"/><text x="450" y="54" text-anchor="middle" class="svg-title">用户问题 + 身份</text><text x="450" y="80" text-anchor="middle" class="svg-label">保留编号、日期、租户和 filters</text>
+<rect x="70" y="150" width="330" height="82" rx="12" fill="#e8f2f5" stroke="#34758a" stroke-width="2"/><text x="235" y="184" text-anchor="middle" class="svg-title">关键词检索</text><text x="235" y="212" text-anchor="middle" class="svg-label">SKU · 错误码 · 合同号 · 精确词</text>
+<rect x="500" y="150" width="330" height="82" rx="12" fill="#d9f2e3" stroke="#2c8452" stroke-width="2"/><text x="665" y="184" text-anchor="middle" class="svg-title">向量检索</text><text x="665" y="212" text-anchor="middle" class="svg-label">自然语言语义 · 同义表达 · 意图</text>
+<rect x="250" y="292" width="400" height="76" rx="12" fill="#fff8e6" stroke="#d99100" stroke-width="2"/><text x="450" y="325" text-anchor="middle" class="svg-title">混合融合 + 过滤 + 重排</text><text x="450" y="351" text-anchor="middle" class="svg-label">RRF · ACL · 版本 · 时间 · 租户</text>
+<rect x="250" y="428" width="400" height="76" rx="12" fill="#f0eaff" stroke="#7655a8" stroke-width="2"/><text x="450" y="461" text-anchor="middle" class="svg-title">生成回答或安全降级</text><text x="450" y="487" text-anchor="middle" class="svg-label">带引用；证据不足则明确“资料不足”</text>
+<path d="M450 94v56M450 110L235 150M450 110L665 150M235 232l215 60M665 232l-215 60M450 368v60" fill="none" stroke="#34758a" stroke-width="3" marker-end="url(#arrow2)"/>
+</svg>
+<h2>5. 如何做：端到端实施步骤</h2>
+<h3>5.1 建立原始文件层</h3><ol><li>在 Unity Catalog 中创建专用 catalog/schema/volume。</li><li>配置 Lakeflow Connect 或受控上传；源系统 ID、文件 URI、修改时间和删除状态必须可追踪。</li><li>把文件内容和治理元数据分离：文件存储在 Volume，表中保留受治理的文件引用、hash、来源、版本和 ACL。</li><li>先定义增量同步、删除传播和权限撤回 SLA，再开始索引。</li></ol>
+<h3>5.2 解析文档</h3><pre><code>WITH parsed_documents AS (
+  SELECT
+    path,
+    ai_parse_document(content, map('version', '2.0')) AS parsed
+  FROM READ_FILES('/Volumes/my_catalog/my_schema/my_documents/',
+                  format =&gt; 'binaryFile')
+)
+SELECT path, parsed
+FROM parsed_documents;</code></pre>
+<p>解析层的输出是结构化 <code>VARIANT</code>，可包含页面、元素、文本、表格和图形描述。需要页码和图像引用时，应按官方选项把页面/元素图像写入 Unity Catalog Volume。REST 调用读取的是 Unity Catalog Volume 路径，而不是任意本地二进制。</p>
+<h3>5.3 语义分块和元数据</h3><pre><code>WITH parsed_documents AS (
+  SELECT ai_parse_document(content) AS parsed
+  FROM READ_FILES('/Volumes/mydata/documents/', format =&gt; 'binaryFile')
+)
+SELECT ai_prep_search(
+  parsed,
+  map('schema', '["company", "document_type", "fiscal_year"]')
+) AS result
+FROM parsed_documents;</code></pre>
+<p><code>ai_prep_search</code> 输出中最重要的字段包括：<code>chunk_id</code>、<code>chunk_position</code>、<code>chunk_to_retrieve</code>、<code>chunk_to_embed</code>、<code>metadata</code> 和页面引用。<code>chunk_to_embed</code> 会把文档标题、页眉、章节、页码、文档上下文和表格摘要等信息与正文组合，以帮助语义检索。</p>
+<h3>5.4 展平为 AI Search 源表</h3><pre><code>WITH parsed_documents AS (
+  SELECT path, ai_parse_document(content) AS parsed
+  FROM READ_FILES('/Volumes/mydata/documents/', format =&gt; 'binaryFile')
+), prepped_documents AS (
+  SELECT path, ai_prep_search(parsed) AS result
+  FROM parsed_documents
+)
+SELECT
+  chunk.value:chunk_id::STRING AS chunk_id,
+  chunk.value:chunk_position::INT AS chunk_position,
+  chunk.value:chunk_to_retrieve::STRING AS chunk_to_retrieve,
+  chunk.value:chunk_to_embed::STRING AS chunk_to_embed,
+  chunk.value:metadata AS metadata,
+  prepped_documents.path AS source_uri
+FROM prepped_documents,
+     LATERAL variant_explode(prepped_documents.result:document.contents) AS chunk;</code></pre>
+<p>官方文档明确指出，这个结果可以写入 Delta 表，并以 <code>chunk_to_embed</code> 作为 embedding 输入列、以 <code>chunk_id</code> 作为主键来建立 AI Search index。</p>
+
+<h2>5. AI Search：为什么不能只做向量检索</h2>
+<p>AI Search 支持向量检索、关键词检索、混合检索、过滤、重排和 ACL。混合检索尤其适合包含 SKU、错误码、合同号、产品型号等精确字符串的企业知识库：关键词检索负责命中特定词，向量检索负责捕捉自然语言语义，RRF 负责融合两套结果。</p>
+<table><tr><th>能力</th><th>用途</th><th>推荐实践</th></tr><tr><td>Hybrid</td><td>同时处理精确词和语义表达</td><td>产品编号、错误码、政策问答默认评估 hybrid</td></tr><tr><td>Filter</td><td>按部门、租户、版本、日期、语言过滤</td><td>把过滤条件放在服务端请求，不信任客户端字段</td></tr><tr><td>Reranking</td><td>对候选结果做更精细的相关性排序</td><td>先扩大候选集，再重排；用黄金问题验证收益</td></tr><tr><td>ACL</td><td>控制谁能访问搜索 endpoint/index</td><td>结合 Unity Catalog 权限和文档级 ACL</td></tr><tr><td>Sync</td><td>让 index 跟随源表更新</td><td>监控索引落后时间和删除传播延迟</td></tr></table>
+
+<h2>6. Databricks App 服务层</h2><p>在 Databricks App 中添加 AI Search index resource 后，平台可以把 index 的三层名称注入环境变量。应用服务主体至少需要对父 catalog、schema 和 index 具备相应权限；不要把 index 名称、租户 ID 或权限范围完全交给浏览器端控制。</p><pre><code>env:
+  - name: VECTOR_SEARCH_INDEX
+    valueFrom: vector-search-index
+
+# Python 示意
+import os
+from databricks.sdk import WorkspaceClient
+
+index_name = os.environ["VECTOR_SEARCH_INDEX"]
+workspace = WorkspaceClient()
+results = workspace.vector_search_indexes.query_index(
+    index_name=index_name,
+    query_text="用户的问题",
+    num_results=10,
+)</code></pre>
+<p>生成回答时，应用应把检索结果的正文和引用元数据一起交给模型，并在 UI 中展示文件、页码、版本、更新时间和来源链接。检索不到足够证据时，应返回“资料不足”，而不是强行生成结论。</p>
+
+<h2>7. 运行条件与限制</h2><ul><li>AI Functions 不能运行在 Classic SQL warehouse；官方总览要求 Databricks Runtime 15.4 LTS 以上，18.2 以上可获得更完整的新能力。</li><li><code>ai_prep_search</code> 当前是 Beta；要求 DBR 18.2+，Serverless 还要求环境版本 3+，并可在 notebook、SQL editor、workflow、job 或 Lakeflow pipeline 中使用。</li><li><code>ai_parse_document</code> 的 REST API 只接受 Unity Catalog Volume 路径，官方 API 参考列出单文档 100 页、100 MB 的 REST 限制；SQL/运行时路径的限制要按目标版本文档核验。</li><li>解析和搜索准备的输出 schema 可能演进；生产表应显式记录 schema version，并避免未经验证就依赖未文档化字段。</li><li>AI Functions 相关模型推理可能产生独立于提交计算的费用；应分别监控 SQL/计算成本与 AI Function 成本。</li></ul>
+
+<h2>8. 业务场景</h2><table><tr><th>场景</th><th>架构重点</th><th>验收问题</th></tr><tr><td>员工政策助手</td><td>生效日期、地区、员工类型过滤</td><td>能否引用当前政策并排除旧版本？</td></tr><tr><td>客服/运维助手</td><td>hybrid + 错误码/型号过滤 + 重排</td><td>是否召回正确版本的处置步骤？</td></tr><tr><td>合同检索</td><td>条款级 chunk、签署状态、强引用</td><td>无权限用户是否完全看不到条款？</td></tr><tr><td>销售资料助手</td><td>产品、市场、日期、机密级别元数据</td><td>是否会把内部竞品信息返回给外部用户？</td></tr><tr><td>研究报告问答</td><td>表格/图形描述、页码、时间范围</td><td>结论是否能回到原始图表和页码？</td></tr></table>
+
+<h2>9. 安全与生产清单</h2><ul><li>□ 源系统、Volume、Delta 表、AI Search index 和 App service principal 均使用最小权限。</li><li>□ 检索过滤在服务端执行；ACL 变化、删除和撤回会传播到 index。</li><li>□ 每个 chunk 保存 document ID、版本、来源 URI、页码、ACL 和更新时间。</li><li>□ 解析失败、索引落后、模型超时和配额错误都有可观测性和告警。</li><li>□ 用黄金问题评估 Recall@k、引用正确率、faithfulness、最终答案正确率、延迟和成本。</li><li>□ 文档内容被视为不可信输入；提示词注入不能改变系统权限或触发未授权工具。</li><li>□ App 的回答显示来源，证据不足时明确降级，不把模型猜测伪装成事实。</li><li>□ CI/CD 管理 App、索引配置和 Lakeflow 任务；不依赖个人 notebook 状态。</li></ul>
+
+<h2>10. 官方参考</h2><p class="source">LinkedIn 原帖（Thomas Hass）：https://www.linkedin.com/posts/thomas-hass-53b39b19a_</p><p class="source">Databricks AI Functions：https://docs.databricks.com/aws/en/large-language-models/ai-functions</p><p class="source">ai_prep_search：https://docs.databricks.com/gcp/en/sql/language-manual/functions/ai_prep_search</p><p class="source">Document Parsing：https://docs.databricks.com/aws/en/agents/agent-bricks/document-parsing</p><p class="source">Databricks AI Search：https://docs.databricks.com/gcp/en/ai-search/ai-search</p><p class="source">AI Search index in Databricks Apps：https://docs.databricks.com/gcp/en/dev-tools/databricks-apps/vector-search</p><p class="source">本文是基于帖子公开正文和官方文档的中文解释与实施模板；Beta、区域可用性、运行时和 API 限制应在目标工作区再次核验。</p>
+</body></html>
